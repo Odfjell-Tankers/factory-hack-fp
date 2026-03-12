@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using Azure.AI.Projects;
 using Azure.AI.Projects.OpenAI;
 using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using RepairPlanner.Models;
 using RepairPlanner.Services;
@@ -22,23 +23,15 @@ public sealed class RepairPlannerAgent(
     private const string AgentInstructions = """
         You are a Repair Planner Agent for tire manufacturing equipment.
         Generate a repair plan with tasks, timeline, and resource allocation.
-        Return the response as valid JSON matching the WorkOrder schema.
-
-        Output JSON with these fields:
-        - workOrderNumber, machineId, title, description
-        - type: "corrective" | "preventive" | "emergency"
-        - priority: "critical" | "high" | "medium" | "low"
-        - status, assignedTo (technician id or null), notes
-        - estimatedDuration: integer (minutes, e.g. 60 not "60 minutes")
-        - partsUsed: [{ partId, partNumber, quantity }]
-        - tasks: [{ sequence, title, description, estimatedDurationMinutes (integer), requiredSkills, safetyNotes }]
-
-        IMPORTANT: All duration fields must be integers representing minutes (e.g. 90), not strings.
+        The output schema is enforced — populate all fields accurately.
 
         Rules:
+        - type: "corrective" | "preventive" | "emergency"
+        - priority: "critical" | "high" | "medium" | "low"
+        - estimatedDuration: integer minutes (e.g. 90)
         - Assign the most qualified available technician
         - Include only relevant parts; empty array if none needed
-        - Tasks must be ordered and actionable
+        - Tasks must be ordered and actionable with integer durations
         """;
 
     // LLMs sometimes return numbers as strings — handle that gracefully
@@ -48,14 +41,26 @@ public sealed class RepairPlannerAgent(
         NumberHandling = JsonNumberHandling.AllowReadingFromString,
     };
 
+    // JSON schema derived from WorkOrder type — enforces structured output from the LLM
+    private static readonly JsonElement WorkOrderSchema =
+        AIJsonUtilities.CreateJsonSchema<WorkOrder>(JsonOptions);
+
     /// <summary>Register (or update) the Prompt Agent definition in Azure AI Foundry.</summary>
     public async Task EnsureAgentVersionAsync(CancellationToken ct = default)
     {
         logger.LogInformation("Creating agent '{AgentName}' with model '{Model}'.", AgentName, modelDeploymentName);
 
+        // Structured output — LLM is constrained to return JSON matching the WorkOrder schema
+        var responseFormat = ChatResponseFormat.ForJsonSchema(
+            WorkOrderSchema,
+            schemaName: "work_order");
+
+        logger.LogDebug("WorkOrder JSON schema: {Schema}", WorkOrderSchema.GetRawText());
+
         var definition = new PromptAgentDefinition(model: modelDeploymentName)
         {
             Instructions = AgentInstructions,
+            ResponseFormat = responseFormat,
         };
 
         var version = await projectClient.Agents.CreateAgentVersionAsync(
@@ -83,6 +88,21 @@ public sealed class RepairPlannerAgent(
         var technicians = await cosmosDb.GetAvailableTechniciansWithSkillsAsync(requiredSkills, ct);
         var parts = await cosmosDb.GetPartsByPartNumbersAsync(requiredPartNumbers, ct);
 
+        if (technicians.Count == 0)
+        {
+            logger.LogWarning(
+                "No available technicians with required skills [{Skills}] for fault '{FaultType}'. " +
+                "Work order will be created as unassigned.",
+                string.Join(", ", requiredSkills), fault.FaultType);
+        }
+
+        if (parts.Count == 0 && requiredPartNumbers.Count > 0)
+        {
+            logger.LogWarning(
+                "Required parts [{Parts}] not found in inventory for fault '{FaultType}'.",
+                string.Join(", ", requiredPartNumbers), fault.FaultType);
+        }
+
         // 3. Build a context-rich prompt for the LLM
         var prompt = BuildPrompt(fault, technicians, parts, requiredSkills, requiredPartNumbers);
 
@@ -93,7 +113,7 @@ public sealed class RepairPlannerAgent(
         var responseText = response.Text ?? "";
 
         // 5. Parse JSON response into a WorkOrder, applying safe defaults
-        var workOrder = ParseWorkOrder(responseText, fault);
+        var workOrder = ParseWorkOrder(responseText, fault, technicians);
 
         // 6. Save to Cosmos DB
         await cosmosDb.CreateWorkOrderAsync(workOrder, ct);
@@ -136,14 +156,16 @@ public sealed class RepairPlannerAgent(
             Available Parts:
             {partsSummary}
 
-            Return ONLY valid JSON matching the WorkOrder schema. No markdown, no explanation.
+            Populate all WorkOrder fields based on the context above.
             """;
     }
 
-    private WorkOrder ParseWorkOrder(string responseText, DiagnosedFault fault)
+    private WorkOrder ParseWorkOrder(string responseText, DiagnosedFault fault, List<Technician> availableTechnicians)
     {
-        // Strip markdown code fences if the LLM wraps the JSON
+        // Structured output guarantees valid JSON, but keep defensive parsing as safety net
         var json = responseText.Trim();
+
+        // Defensive: strip markdown fences in case structured output is bypassed
         if (json.StartsWith("```"))
         {
             var firstNewline = json.IndexOf('\n');
@@ -159,7 +181,7 @@ public sealed class RepairPlannerAgent(
         }
         catch (JsonException ex)
         {
-            logger.LogWarning(ex, "Failed to parse LLM response as WorkOrder. Using defaults.");
+            logger.LogWarning(ex, "Structured output parse failed — falling back to defaults.");
             workOrder = null;
         }
 
@@ -177,10 +199,33 @@ public sealed class RepairPlannerAgent(
         if (string.IsNullOrEmpty(workOrder.Status))
             workOrder.Status = "new";
 
-        workOrder.Priority ??= "medium";
+        // Override LLM priority with deterministic calculation based on fault severity
+        workOrder.Priority = DeterminePriority(fault.Severity);
         workOrder.Type ??= "corrective";
         workOrder.CreatedDate = DateTime.UtcNow;
 
+        // Clear assignment if no technicians are available
+        if (availableTechnicians.Count == 0)
+        {
+            workOrder.AssignedTo = null;
+            workOrder.Notes = string.IsNullOrEmpty(workOrder.Notes)
+                ? "UNASSIGNED: No technicians with required skills are currently available."
+                : $"{workOrder.Notes} | UNASSIGNED: No technicians with required skills are currently available.";
+        }
+
         return workOrder;
     }
+
+    /// <summary>
+    /// Map fault severity to work order priority.
+    /// Critical faults → critical priority, high → high, etc.
+    /// </summary>
+    private static string DeterminePriority(string severity) => severity.ToLowerInvariant() switch
+    {
+        "critical" => "critical",
+        "high" => "high",
+        "medium" => "medium",
+        "low" => "low",
+        _ => "medium", // default for unknown severities
+    };
 }
