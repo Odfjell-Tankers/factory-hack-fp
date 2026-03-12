@@ -41,26 +41,33 @@ public sealed class RepairPlannerAgent(
         NumberHandling = JsonNumberHandling.AllowReadingFromString,
     };
 
-    // JSON schema derived from WorkOrder type — enforces structured output from the LLM
-    private static readonly JsonElement WorkOrderSchema =
-        AIJsonUtilities.CreateJsonSchema<WorkOrder>(JsonOptions);
+    // JSON schema derived from WorkOrder type — embedded in agent instructions for structured output
+    private static readonly Lazy<string> WorkOrderSchemaJson = new(() =>
+    {
+        var schema = AIJsonUtilities.CreateJsonSchema(
+            typeof(WorkOrder),
+            serializerOptions: JsonOptions);
+        return schema.GetRawText();
+    });
 
     /// <summary>Register (or update) the Prompt Agent definition in Azure AI Foundry.</summary>
     public async Task EnsureAgentVersionAsync(CancellationToken ct = default)
     {
         logger.LogInformation("Creating agent '{AgentName}' with model '{Model}'.", AgentName, modelDeploymentName);
 
-        // Structured output — LLM is constrained to return JSON matching the WorkOrder schema
-        var responseFormat = ChatResponseFormat.ForJsonSchema(
-            WorkOrderSchema,
-            schemaName: "work_order");
+        // Embed JSON schema in instructions since PromptAgentDefinition doesn't support ResponseFormat
+        var instructions = $"""
+            {AgentInstructions}
 
-        logger.LogDebug("WorkOrder JSON schema: {Schema}", WorkOrderSchema.GetRawText());
+            You MUST return ONLY valid JSON matching this exact schema:
+            {WorkOrderSchemaJson.Value}
+            """;
+
+        logger.LogDebug("WorkOrder JSON schema: {Schema}", WorkOrderSchemaJson.Value);
 
         var definition = new PromptAgentDefinition(model: modelDeploymentName)
         {
-            Instructions = AgentInstructions,
-            ResponseFormat = responseFormat,
+            Instructions = instructions,
         };
 
         var version = await projectClient.Agents.CreateAgentVersionAsync(
